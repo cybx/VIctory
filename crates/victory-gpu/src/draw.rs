@@ -214,6 +214,7 @@ fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
             let len = root_len(shadow.left(address), RootView::Uav);
             shadow.refresh(list, address, len);
             shadow.gpu_writes(list, address, len);
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
             Some(gpu)
         }
     }
@@ -812,6 +813,7 @@ impl State {
         };
         if let Some((a, s)) = &shadow {
             s.refresh(list, *a, s.left(*a).min(1 << 20));
+            list.buffer_state(&s.buffer, crate::host::BUFFER_READ);
         }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
