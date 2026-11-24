@@ -8,10 +8,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
+use super::{AddressView, UserData};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -36,6 +36,7 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    pub address_srvs: Vec<AddressView>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -216,8 +217,9 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
-    /// Bytes each root view holds, by root parameter (see [`Self::root_view_size`]).
-    root_sizes: HashMap<usize, V>,
+    /// Bytes each root view holds, by the user-data dword that holds them
+    /// (see [`Self::root_view_size`]).
+    root_sizes: HashMap<u32, V>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -292,6 +294,9 @@ struct Lower<'a> {
     /// The host's guard slots ([`Lower::heap_guard`]), view heap then
     /// sampler heap, read once.
     guard_slots: [Option<V>; 2],
+    /// Root SRVs at addresses in root constants, in the order of the
+    /// shader's `address_srvs` (see [`Lower::address_srv`]).
+    address_views: Vec<AddressView>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -715,6 +720,7 @@ impl<'a> Lower<'a> {
             counters: HashMap::new(),
             abort: None,
             guard_slots: [None; 2],
+            address_views: Vec::new(),
         }
     }
 
@@ -1272,6 +1278,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            address_srvs: self.address_views,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -1553,11 +1560,12 @@ impl<'a> Lower<'a> {
 
     /// For a root view (a root CBV, SRV or UAV), the bytes the host's view
     /// holds from its start, which the host passes in the user-data dword of
-    /// the view's address. A root view has no bounds on the host: an access
-    /// past what the host mapped (an offset from data the host has not
-    /// mirrored) is a GPU page fault, which some hosts' GPUs stall on until
-    /// the driver resets the device. Accesses are checked against this size
-    /// as the console's bounded buffer views are.
+    /// the view's address; for an address in root constants, in the size
+    /// dword of its root SRV ([`AddressView::size`]). A root view has no
+    /// bounds on the host: an access past what the host mapped (an offset
+    /// from data the host has not mirrored) is a GPU page fault, which some
+    /// hosts' GPUs stall on until the driver resets the device. Accesses are
+    /// checked against this size as the console's bounded buffer views are.
     fn root_view_size(&mut self, src: &Source) -> Option<V> {
         let Source::Built { address, .. } = src else {
             return None;
@@ -1566,43 +1574,27 @@ impl<'a> Lower<'a> {
             return None;
         }
         let rp = *self.x.native.layout.get(address.param)?;
-        if rp.root != RootType::Descriptor {
-            return None;
-        }
-        if let Some(&v) = self.root_sizes.get(&address.param) {
+        let index = match rp.root {
+            RootType::Descriptor => u32::from(rp.user_data),
+            RootType::Constants => self.address_srv(address).ok()?.1,
+            _ => return None,
+        };
+        if let Some(&v) = self.root_sizes.get(&index) {
             return Some(v);
         }
-        let index = u32::from(rp.user_data);
-        self.user_reads.insert(
-            index,
-            UserData {
+        if rp.root == RootType::Descriptor {
+            self.user_reads.insert(
                 index,
-                slot: rp.slot,
-                root: RootType::Descriptor,
-                dword: 0,
-            },
-        );
-        self.s.user_data = self.s.user_data.max(index + 1);
-        let h = match self.user_data {
-            Some(h) => h,
-            None => {
-                let h = self.s.user_data_handle();
-                self.user_data = Some(h);
-                h
-            }
-        };
-        let entry = self.s.entry;
-        let row = self.s.m.i32(index / 4);
-        let r = self.s.op(
-            entry,
-            "cbufferLoadLegacy.i32",
-            Attr::ReadOnly,
-            self.s.t.cbuf_ret,
-            59,
-            &[h, row],
-        );
-        let v = self.s.m.extract(entry, r, index % 4);
-        self.root_sizes.insert(address.param, v);
+                UserData {
+                    index,
+                    slot: rp.slot,
+                    root: RootType::Descriptor,
+                    dword: 0,
+                },
+            );
+        }
+        let v = self.user_dword(index);
+        self.root_sizes.insert(index, v);
         Some(v)
     }
 
@@ -3420,14 +3412,19 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
+        // `s_load_dword*` through the address of a root view, or through an
+        // address in root constants (a root SRV, see [`Self::address_srv`]),
+        // reads it as `s_buffer_load_dword*` on a descriptor built around it.
         let root_desc = self.scalar.get(&site).copied().and_then(|a| {
-            (self.x.native.layout.get(a.param)?.root == RootType::Descriptor).then_some(
-                Source::Built {
-                    address: a,
-                    bits: 0,
-                    words: [0, 0],
-                },
+            matches!(
+                self.x.native.layout.get(a.param)?.root,
+                RootType::Descriptor | RootType::Constants
             )
+            .then_some(Source::Built {
+                address: a,
+                bits: 0,
+                words: [0, 0],
+            })
         });
         let Some(rest) = name.strip_prefix("s_buffer_load_dword").or_else(|| {
             root_desc
@@ -3476,10 +3473,12 @@ impl<'a> Lower<'a> {
             (src, addr, (!has_soff && extra.is_none()).then_some(off))
         };
         let kind = self.used_kind(src);
-        let raw = matches!(
-            kind,
-            Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
-        );
+        let on_pair = matches!(src, Source::Built { address, .. } if self.in_constants(address));
+        let raw = on_pair
+            || matches!(
+                kind,
+                Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
+            );
         // A root view's size, for the reads checked against it: raw reads,
         // and constant buffer reads at a computed offset (one at a constant
         // offset is in the title's own constant layout, and needs no user
@@ -4475,6 +4474,64 @@ impl<'a> Lower<'a> {
         Ok((h, index, off))
     }
 
+    /// The user-data dwords the program's parameters reach. The dwords past
+    /// them are no console dwords: they hold what the host passes besides,
+    /// the heap guard slots ([`Self::heap_guard`]), then the sizes of the
+    /// root SRVs at addresses in root constants ([`Self::address_srv`]).
+    fn console_dwords(&self) -> u32 {
+        self.x
+            .native
+            .layout
+            .iter()
+            .map(|p| u32::from(p.user_data) + p.sgprs)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// `a` starts from a root-constant pair.
+    fn in_constants(&self, a: &Address) -> bool {
+        self.x
+            .native
+            .layout
+            .get(a.param)
+            .is_some_and(|rp| rp.root == RootType::Constants)
+    }
+
+    /// The root SRV at the address the root-constant pair that `a` starts
+    /// from holds: its handle, and the user-data dword the host passes the
+    /// bytes it holds in ([`AddressView::size`]).
+    fn address_srv(&mut self, a: &Address) -> Result<(V, u32), Why> {
+        let pair = *self
+            .x
+            .res
+            .pairs
+            .iter()
+            .find(|p| p.lo == (a.param, a.dword))
+            .ok_or("an address in root constants without its high half")?;
+        let half = |(param, dword): (usize, u32)| {
+            let rp = self.x.native.layout[param];
+            UserData {
+                index: u32::from(rp.user_data) + dword,
+                slot: rp.slot,
+                root: rp.root,
+                dword,
+            }
+        };
+        let (lo, hi) = (half(pair.lo), half(pair.hi));
+        let view = match self.address_views.iter().find(|v| v.lo == lo && v.hi == hi) {
+            Some(&view) => view,
+            None => {
+                // After the two heap guard slots.
+                let size = self.console_dwords() + 2 + self.address_views.len() as u32;
+                let view = AddressView { lo, hi, size };
+                self.address_views.push(view);
+                view
+            }
+        };
+        // Made with the view, so the shader's `t<n>` is the n-th view.
+        Ok((self.s.address_srv_handle(view.lo.index), view.size))
+    }
+
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
@@ -4566,6 +4623,12 @@ impl<'a> Lower<'a> {
                     .layout
                     .get(address.param)
                     .ok_or("a descriptor built around a table in the code")?;
+                if rp.root == RootType::Constants {
+                    return match props.0 {
+                        11 => Ok(self.address_srv(address)?.0),
+                        _ => Err("a write or typed view through an address in root constants"),
+                    };
+                }
                 let kind = self
                     .x
                     .native
@@ -4801,15 +4864,7 @@ impl<'a> Lower<'a> {
             None => {
                 // After every user-data dword the program's parameters
                 // reach, so it is no console dword.
-                let after = self
-                    .x
-                    .native
-                    .layout
-                    .iter()
-                    .map(|p| u32::from(p.user_data) + p.sgprs)
-                    .max()
-                    .unwrap_or(0);
-                let at = after + u32::from(sampler);
+                let at = self.console_dwords() + u32::from(sampler);
                 let root = if sampler {
                     RootType::SamplerHeap
                 } else {
@@ -8924,6 +8979,106 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    /// Lowers a compute program with four root constants in `s0..s3` and a
+    /// table in `s4` whose first descriptor is a raw UAV in `s[8:11]`, `body`
+    /// leaving in `v0` what is stored there: the root SRVs at addresses in
+    /// root constants, and the other root SRVs.
+    fn lowers_with_constants(
+        body: &[u32],
+    ) -> Result<(Vec<super::AddressView>, Vec<u8>), crate::ShaderError> {
+        let mut words = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+        ];
+        words.extend(body);
+        words.extend([
+            0xE070_0000,
+            0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+            S_ENDPGM,
+        ]);
+        let constants = RootParam {
+            sgprs: 4,
+            ..root(RootType::Constants, 0, 0)
+        };
+        let uav = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        lower_with(&words, vec![constants, root(RootType::Table, 4, 1)], vec![uav])
+            .map(|l| (l.address_srvs, l.root_srvs))
+    }
+
+    /// `s[12:15]`: a raw buffer descriptor built around the pair `s[2:3]`.
+    const BUILT_ON_THE_PAIR: [u32; 6] = [
+        0xBE8C_0302, // s_mov_b32 s12, s2
+        0xBE8D_0303, // s_mov_b32 s13, s3
+        0xBE8E_03C1, // s_mov_b32 s14, -1
+        0xBE8F_03FF,
+        0x1101_4FAC, // s_mov_b32 s15, 0x11014fac
+        0xBF80_0000, // s_nop 0
+    ];
+
+    #[test]
+    fn reads_through_a_root_constant_pair_are_a_root_srv() {
+        let half = |dword| super::UserData {
+            index: dword,
+            slot: 0,
+            root: RootType::Constants,
+            dword,
+        };
+        // The size dword after the five console dwords and the two heap
+        // guard slots.
+        let view = super::AddressView {
+            lo: half(2),
+            hi: half(3),
+            size: 7,
+        };
+        let global = [
+            0xDC30_8000,
+            0x0002_0001, // global_load_dword v0, v1, s[2:3]
+        ];
+        let mut scalar = BUILT_ON_THE_PAIR.to_vec();
+        scalar.extend([
+            0xF420_0186,
+            0xFA00_0000, // s_buffer_load_dword s6, s[12:15], null
+            0x7E00_0206, // v_mov_b32 v0, s6
+        ]);
+        let scalar_load = [
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            0x7E00_0206, // v_mov_b32 v0, s6
+        ];
+        for body in [&global[..], &scalar, &scalar_load] {
+            let (views, root_srvs) = lowers_with_constants(body).unwrap();
+            assert_eq!(views, [view]);
+            assert!(root_srvs.is_empty());
+        }
+    }
+
+    #[test]
+    fn other_uses_of_a_root_constant_pair_stop_with_a_reason() {
+        let reason = |body: &[u32]| match lowers_with_constants(body) {
+            Err(crate::ShaderError::Unsupported { what, .. }) => what,
+            other => panic!("{:?}", other.map(|_| ())),
+        };
+        let mut typed = BUILT_ON_THE_PAIR.to_vec();
+        typed.extend([
+            0xE000_2000,
+            0x8003_0001, // buffer_load_format_x v0, v1, s[12:15], 0 idxen
+        ]);
+        assert_eq!(
+            reason(&typed),
+            "a write or typed view through an address in root constants"
+        );
     }
 
     #[test]

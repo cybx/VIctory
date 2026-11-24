@@ -36,6 +36,17 @@
 //!   `b<i>` / `t<i>` / `u<i>` in [`ROOT_CBV_SPACE`], `i` the title's root
 //!   parameter index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`],
 //!   [`HostShader::root_uavs`]); the address the title sets is the buffer's.
+//! * **Addresses in root constants** (added 2026-11-24): a 64-bit address
+//!   the title passes as two root-constant dwords (low half first, in
+//!   consecutive user SGPRs) and the shader only reads through
+//!   (`global_load_*`, `s_load_dword*`, `s_buffer_load_*` on a descriptor
+//!   built around it) is a root SRV (raw buffer) `t<n>` in
+//!   [`ROOT_ADDRESS_SPACE`], `n` the position in
+//!   [`HostShader::address_srvs`]. The host composes the address from the
+//!   two constants' current values at every draw, binds the buffer there and
+//!   passes the bytes it holds in user-data dword [`AddressView::size`]:
+//!   reads past them read 0, as a root view has no bounds on the host.
+//!   Writes and typed views through such an address stop the translation.
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
@@ -108,7 +119,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{ROOT_ADDRESS_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -170,6 +181,21 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
+    /// Root SRVs (raw buffers) at addresses in root constants: `t<n>` in
+    /// [`ROOT_ADDRESS_SPACE`] for the view at position n.
+    pub address_srvs: Vec<AddressView>,
+}
+
+/// A root SRV at the 64-bit address two root-constant dwords hold (both
+/// with `root` [`RootType::Constants`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddressView {
+    pub lo: UserData,
+    pub hi: UserData,
+    /// The user-data dword the host fills with the bytes the view holds
+    /// from the address (0 when it holds none): past the title's console
+    /// dwords, and not in [`HostShader::user_data`]. Reads past them read 0.
+    pub size: u32,
 }
 
 impl HostShader {
@@ -180,6 +206,7 @@ impl HostShader {
             .user_data
             .iter()
             .map(|u| u.index + 1)
+            .chain(self.address_srvs.iter().map(|v| v.size + 1))
             .max()
             .unwrap_or(0);
         n.next_multiple_of(4)
@@ -423,6 +450,7 @@ pub fn emit(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        address_srvs: l.address_srvs,
     })
 }
 
@@ -682,6 +710,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            address_srvs: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -693,6 +722,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                address_srvs: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

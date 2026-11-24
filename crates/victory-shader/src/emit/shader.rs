@@ -12,6 +12,9 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs, SRVs and UAVs are bound: `b<root parameter index>`,
 /// `t<root parameter index>` and `u<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// Where root SRVs at addresses passed in two root constants are bound:
+/// `t<n>` in this space, `n` the position in the shader's list of them.
+pub const ROOT_ADDRESS_SPACE: u32 = 2;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -69,6 +72,9 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// Root SRVs (raw buffers) at addresses in root constants, by the low
+    /// half's user-data index, with their handles.
+    pub address_srvs: Vec<(u32, V)>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -141,6 +147,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            address_srvs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -284,6 +291,32 @@ impl Shader {
         h
     }
 
+    /// The handle of the root SRV (a raw buffer) at the address whose low
+    /// half is user-data dword `key`: `t<n>` in [`ROOT_ADDRESS_SPACE`], `n`
+    /// its position in `address_srvs`.
+    pub fn address_srv_handle(&mut self, key: u32) -> V {
+        if let Some(&(_, h)) = self.address_srvs.iter().find(|r| r.0 == key) {
+            return h;
+        }
+        let r = self.m.i32(self.address_srvs.len() as u32);
+        let bind = [r, r, self.m.i32(ROOT_ADDRESS_SPACE), self.m.i8(0)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.address_srvs.push((key, h));
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -374,6 +407,7 @@ impl Shader {
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || !self.root_uavs.is_empty()
+            || !self.address_srvs.is_empty()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -428,20 +462,28 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() {
+            if !self.root_srvs.is_empty() || !self.address_srvs.is_empty() {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
                 let p = self.m.ptr(ty);
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                // Root SRVs by root parameter, then those at addresses in
+                // root constants by position.
+                let views = self
+                    .root_srvs
+                    .iter()
+                    .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
+                    .chain((0..self.address_srvs.len() as u32).map(|n| (ROOT_ADDRESS_SPACE, n)))
+                    .collect::<Vec<_>>();
+                for (n, (space, register)) in views.into_iter().enumerate() {
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, register)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
                         Some(i32c(&mut self, 0)),
@@ -450,8 +492,8 @@ impl Shader {
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 4,
-                        space: ROOT_CBV_SPACE,
-                        register: u32::from(slot),
+                        space,
+                        register,
                         dxil_kind: 11,
                     });
                 }

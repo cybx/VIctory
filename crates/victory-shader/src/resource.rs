@@ -11,8 +11,13 @@
 //! descriptor's address itself. Each descriptor operand and each scalar
 //! memory address is traced through the SSA values back to those
 //! parameters, by data flow: copies, phis that agree, and additions.
+//!
+//! A title can also pass a 64-bit address as two root constants, low half
+//! first, in consecutive user SGPRs (within one parameter or across two).
+//! Such a pair is recognised from its high half, which the code uses only
+//! as the high half of an address (or adds a carry to): [`Pair`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use crate::ShaderError;
@@ -40,11 +45,22 @@ pub struct RelOffset {
 pub struct Address {
     /// Index into the layout, or [`CODE`].
     pub param: usize,
+    /// The dword of the base within `param`: 0 except for an address in
+    /// root constants ([`Pair`]), where it is the low half's.
+    pub dword: u32,
     /// Added modulo 2^32 (with carry into the high half of a root
     /// descriptor's address).
     pub offset: u32,
     pub dynamic: Option<Value>,
     pub rel: Option<RelOffset>,
+}
+
+/// A 64-bit address in two root-constant dwords: layout index and dword
+/// of its low half and of its high half (the next user SGPR).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pair {
+    pub lo: (usize, u32),
+    pub hi: (usize, u32),
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -131,6 +147,8 @@ pub struct Resources {
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
     pub waterfall: Waterfall,
+    /// The root-constant pairs the addresses above start from, once each.
+    pub pairs: Vec<Pair>,
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -253,6 +271,18 @@ pub fn track(
             }
         }
     }
+    let built = out.descriptors.iter().flat_map(|d| {
+        d.source.leaves().into_iter().filter_map(|l| match l {
+            Source::Built { address, .. } => Some(*address),
+            _ => None,
+        })
+    });
+    let addresses: Vec<Address> = out.scalar.iter().map(|s| s.1).chain(built).collect();
+    for pair in addresses.into_iter().filter_map(|a| t.pair(a)) {
+        if !out.pairs.contains(&pair) {
+            out.pairs.push(pair);
+        }
+    }
     // The proof needs the per-lane form. Without it nothing is emitted, and
     // its failure is the one to report, so the reads stay unproven here.
     if t.lanes.is_none() {
@@ -291,8 +321,9 @@ enum Term {
     Value(Value),
 }
 
-/// A 32-bit sum: optional root parameter (as its first dword), constant,
-/// optional computed term, and whether non-linear/multi-term arithmetic was used.
+/// A 32-bit sum: optional root parameter (as its first dword, or the low
+/// half of a [`Pair`]), constant, optional computed term, and whether
+/// non-linear/multi-term arithmetic was used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Sum {
     base: Option<Value>,
@@ -330,6 +361,9 @@ struct Tracer<'a> {
     rpo: Vec<usize>,
     /// Memoized non-cyclic sums by value.
     sums: RefCell<HashMap<Value, Sum>>,
+    /// The low half of the root-constant pair [`Tracer::pair_sum`] traces,
+    /// a base while it does (and nothing is memoized).
+    pair: Cell<Option<Value>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -392,6 +426,7 @@ impl<'a> Tracer<'a> {
             lanes,
             rpo,
             sums: RefCell::new(HashMap::new()),
+            pair: Cell::new(None),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -633,6 +668,16 @@ impl<'a> Tracer<'a> {
         self.sum_rec(t, &mut Vec::new(), &mut Vec::new()).sum
     }
 
+    /// The sum `t` computes with `low`, the low half of a root-constant
+    /// [`Pair`], counted as a base too. The values that depend on it sum
+    /// otherwise than [`Tracer::sum`] memoizes, so nothing is memoized.
+    fn pair_sum(&self, t: Term, low: Value) -> Sum {
+        self.pair.set(Some(low));
+        let s = self.sum(t);
+        self.pair.set(None);
+        s
+    }
+
     fn sum_rec(
         &self,
         t: Term,
@@ -653,7 +698,8 @@ impl<'a> Tracer<'a> {
             }
             Term::Value(v) => v,
         };
-        if let Some(&sum) = self.sums.borrow().get(&v) {
+        let memo = self.pair.get().is_none();
+        if memo && let Some(&sum) = self.sums.borrow().get(&v) {
             return Trace { sum, cycle: None };
         }
         if let Some(depth) = visiting.iter().position(|&x| x == v) {
@@ -671,7 +717,7 @@ impl<'a> Tracer<'a> {
             return cached;
         }
         let (res, cache_global) = self.sum_value(v, visiting, frames);
-        if cache_global && res.cycle.is_none() {
+        if memo && cache_global && res.cycle.is_none() {
             self.sums.borrow_mut().insert(v, res.sum);
         } else if let Some(frame) = frames.last_mut() {
             frame.insert(v, res);
@@ -696,6 +742,20 @@ impl<'a> Tracer<'a> {
         };
         if let Some(reg) = self.inputs[v.0 as usize] {
             return match self.param_of(reg) {
+                // The low half of the pair being traced (see
+                // [`Tracer::pair_sum`]): a base, unlike other root constants.
+                _ if self.pair.get() == Some(v) => (
+                    Trace {
+                        sum: Sum {
+                            base: Some(v),
+                            offset: 0,
+                            dynamic: None,
+                            multi: false,
+                        },
+                        cycle: None,
+                    },
+                    false,
+                ),
                 Some((param, 0)) if self.is_base_root(param) => (
                     Trace {
                         sum: Sum {
@@ -1184,6 +1244,9 @@ impl<'a> Tracer<'a> {
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
+        if let Some(a) = self.pair_address(lo, hi, &extra) {
+            return a;
+        }
         let s = self.sum(lo);
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         let use_rel = s.multi || (s.dynamic.is_some() && extra.dynamic.is_some());
@@ -1219,6 +1282,7 @@ impl<'a> Tracer<'a> {
             };
             return Ok(Address {
                 param: CODE,
+                dword: 0,
                 offset,
                 dynamic,
                 rel,
@@ -1252,9 +1316,92 @@ impl<'a> Tracer<'a> {
         };
         Ok(Address {
             param,
+            dword: 0,
             offset,
             dynamic,
             rel,
+        })
+    }
+
+    /// The address a root-constant pair holds: `hi` is the pair's high half
+    /// (possibly plus a carry) and the sum of `lo` starts from its low half.
+    /// `None` when `lo` and `hi` are no pair; the other kinds of address
+    /// never have a root constant as their high half.
+    fn pair_address(
+        &self,
+        lo: Term,
+        hi: Term,
+        extra: &Sum,
+    ) -> Option<Result<Address, &'static str>> {
+        let (low, high) = self.pair_high(hi)?;
+        let s = self.pair_sum(lo, low);
+        if s.base != Some(low) {
+            return None;
+        }
+        let (param, dword) = self.param_of(self.inputs[low.0 as usize]?)?;
+        if s.multi || s.dynamic.is_some() && extra.dynamic.is_some() {
+            return Some(Err("an address with two computed terms"));
+        }
+        let dynamic = s.dynamic.or(extra.dynamic);
+        if !self.high_half(hi, Some(high))
+            && !(dynamic.is_some() && self.carried(hi, Term::Value(high), &mut Vec::new()))
+        {
+            return Some(Err("an address with an untracked high half"));
+        }
+        Some(Ok(Address {
+            param,
+            dword,
+            offset: s.offset.wrapping_add(extra.offset),
+            dynamic,
+            rel: None,
+        }))
+    }
+
+    /// The root-constant input `hi` is, or adds a carry to (`s_addc_u32`,
+    /// `v_add_co_ci_u32`, as [`Tracer::carried`] walks), when the user SGPR
+    /// below it holds a root constant too: (low half, high half) on entry.
+    fn pair_high(&self, hi: Term) -> Option<(Value, Value)> {
+        let Term::Value(v) = hi else { return None };
+        if let Some(Reg::S(code)) = self.inputs[v.0 as usize] {
+            let below = code.checked_sub(1)?;
+            if !self.is_constant(code) || !self.is_constant(below) {
+                return None;
+            }
+            let low = self.p.inputs.iter().find(|i| i.0 == Reg::S(below))?.1;
+            return Some((low, v));
+        }
+        if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
+            return self.pair_high(a).or_else(|| self.pair_high(b));
+        }
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        if inst.name() != "v_add_co_ci_u32" {
+            return None;
+        }
+        f.src[..2.min(f.src.len())]
+            .iter()
+            .find_map(|o| self.pair_high(self.vterm(inst, o)?))
+    }
+
+    /// User SGPR `code` holds a root-constant dword.
+    fn is_constant(&self, code: u8) -> bool {
+        self.param_of(Reg::S(code))
+            .is_some_and(|(i, _)| self.layout[i].root == RootType::Constants)
+    }
+
+    /// The pair an address in root constants starts from.
+    fn pair(&self, a: Address) -> Option<Pair> {
+        let rp = self.layout.get(a.param)?;
+        if rp.root != RootType::Constants {
+            return None;
+        }
+        let low = u32::from(self.stage.user_sgpr(rp.user_data)) + a.dword;
+        let high = u8::try_from(low + 1).ok()?;
+        Some(Pair {
+            lo: (a.param, a.dword),
+            hi: self.param_of(Reg::S(high))?,
         })
     }
 
@@ -2429,6 +2576,7 @@ pub(crate) mod tests {
     fn at(param: usize, offset: u32) -> Address {
         Address {
             param,
+            dword: 0,
             offset,
             dynamic: None,
             rel: None,
@@ -4280,5 +4428,109 @@ pub(crate) mod tests {
                 what: "an address from a phi"
             }
         );
+    }
+
+    /// The pair and the address of the one global load in `words`.
+    fn pair_load(words: &[u32], layout: &[RootParam]) -> (Vec<Pair>, Address) {
+        let r = track_words(words, layout, HwStage::Cs);
+        let [(_, a)] = r.scalar[..] else {
+            panic!("{:?}", r.scalar)
+        };
+        (r.pairs, a)
+    }
+
+    #[test]
+    fn root_constant_pairs_are_addresses() {
+        let [l0, l1] = global_load(1, 0, 0, 0);
+        let (pairs, a) = pair_load(&[l0, l1, S_ENDPGM], &[param(Constants, 0, 2)]);
+        assert_eq!(
+            pairs,
+            [Pair {
+                lo: (0, 0),
+                hi: (0, 1)
+            }]
+        );
+        assert_eq!((a.param, a.dword, a.offset), (0, 0, 0));
+        assert!(a.dynamic.is_some(), "the VGPR offset is the computed term");
+    }
+
+    #[test]
+    fn a_root_constant_pair_at_a_later_dword() {
+        let [l0, l1] = global_load(1, 0, 2, 0);
+        let (pairs, a) = pair_load(&[l0, l1, S_ENDPGM], &[param(Constants, 0, 4)]);
+        assert_eq!(
+            pairs,
+            [Pair {
+                lo: (0, 2),
+                hi: (0, 3)
+            }]
+        );
+        assert_eq!((a.param, a.dword), (0, 2));
+    }
+
+    #[test]
+    fn a_root_constant_pair_across_two_parameters() {
+        let [l0, l1] = global_load(1, 0, 2, 0);
+        let (pairs, a) = pair_load(
+            &[l0, l1, S_ENDPGM],
+            &[param(Constants, 0, 3), param(Constants, 3, 1)],
+        );
+        assert_eq!(
+            pairs,
+            [Pair {
+                lo: (0, 2),
+                hi: (1, 0)
+            }]
+        );
+        assert_eq!((a.param, a.dword), (0, 2));
+    }
+
+    #[test]
+    fn a_root_constant_pair_plus_an_offset_with_its_carry() {
+        let (pairs, a) = pair_load(
+            &[
+                0xD70F_6A02,
+                0x0002_0000, // v_add_co_u32 v2, vcc_lo, s0, v0
+                0xD528_6A03,
+                0x01A9_0001, // v_add_co_ci_u32 v3, vcc_lo, s1, 0, vcc_lo
+                0xDC30_8000,
+                0x017D_0002, // global_load_dword v1, v[2:3], off
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 2)],
+        );
+        assert_eq!(
+            pairs,
+            [Pair {
+                lo: (0, 0),
+                hi: (0, 1)
+            }]
+        );
+        assert_eq!((a.param, a.dword, a.offset), (0, 0, 0));
+        assert!(a.dynamic.is_some());
+    }
+
+    #[test]
+    fn a_root_constant_without_its_high_half_is_no_address() {
+        let [l0, l1] = global_load(1, 0, 0, 0);
+        for hi in [
+            0xBE81_0303, // s_mov_b32 s1, s3: the high half of another pair
+            0xBE81_0380, // s_mov_b32 s1, 0: a 32-bit address
+        ] {
+            let err = try_track_words(
+                &[hi, l0, l1, S_ENDPGM],
+                &[param(Constants, 0, 4)],
+                HwStage::Cs,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                ShaderError::Unsupported {
+                    offset: 4,
+                    what: "an address from a root parameter that is no address"
+                },
+                "{hi:#x}"
+            );
+        }
     }
 }

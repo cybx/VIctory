@@ -189,6 +189,7 @@ fn lower_cs(words: &[u32]) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        address_srvs: lowered.address_srvs,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -1127,6 +1128,7 @@ fn build_root_srv_cs(body: &[u32]) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        address_srvs: lowered.address_srvs,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -1564,6 +1566,7 @@ fn root_uav_graphics_stages_validate_and_build_pso() {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: slots.to_vec(),
+            address_srvs: Vec::new(),
         }
     };
 
@@ -1879,4 +1882,105 @@ fn structured_access_through_a_root_uav_reaches_index_times_stride() {
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// Runs `body` with an address in root constants (`s[2:3]`) and a root SRV
+/// bound for it (`t0` in `ROOT_ADDRESS_SPACE`, the root parameter after the
+/// user data) holding `0x100 + k` in dword `k`, of which the host passes
+/// `bytes` as the bytes the view holds; checks that `v0` ends up `want`.
+fn reads_through_a_root_constant_pair(body: &[u32], bytes: u32, want: u32) {
+    let shader = build_valu_cs(body);
+    assert!(shader.root_srvs.is_empty());
+    let [view] = shader.address_srvs[..] else {
+        panic!("{:?}", shader.address_srvs)
+    };
+    assert_eq!((view.lo.dword, view.hi.dword), (2, 3));
+    assert!(
+        shader.user_data.iter().all(|u| u.index != view.size),
+        "the size dword is no console dword"
+    );
+    let data: Vec<u32> = (0..8).map(|k| 0x100 + k).collect();
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        // The constants hold an address the host does not use: it binds the
+        // buffer itself.
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                RootType::Constants => 0x1_0000 * (u.dword + 1),
+                root => super::host::guard(root, 1, 0).unwrap_or(0),
+            };
+        }
+        ud[view.size as usize] = bytes;
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: data.clone(),
+                            },
+                        ),
+                    ],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(out[0][0], want, "{label}: dword 3 of {bytes} bytes");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// `global_load_dword v0, v5, s[2:3] offset:4` with `v5 = 8`: dword 3.
+const GLOBAL_DWORD_3: [u32; 3] = [
+    vop1(0x001, 5, 128 + 8), // v_mov_b32 v5, 8
+    0xDC30_8004,
+    0x0002_0005, // global_load_dword v0, v5, s[2:3] offset:4
+];
+
+/// `s_load_dword s6, s[2:3], 0xc`, then `v0 = s6`: dword 3.
+const SCALAR_DWORD_3: [u32; 3] = [
+    0xF400_0181,
+    0xFA00_000C,             // s_load_dword s6, s[2:3], 0xc
+    vop1(0x001, 0, sgpr(6)), // v_mov_b32 v0, s6
+];
+
+/// A global load through an address the title passes as two root constants
+/// reads the root SRV the host binds at that address.
+#[test]
+fn global_loads_through_a_root_constant_pair_read_its_root_srv() {
+    reads_through_a_root_constant_pair(&GLOBAL_DWORD_3, 32, 0x103);
+}
+
+/// A scalar load through the same address reads it too.
+#[test]
+fn scalar_loads_through_a_root_constant_pair_read_its_root_srv() {
+    reads_through_a_root_constant_pair(&SCALAR_DWORD_3, 32, 0x103);
+}
+
+/// Reads through an address in root constants stop at the bytes the host
+/// says its view holds: a dword ending at the size reads, one past it reads
+/// 0 rather than memory the host may not have mapped.
+#[test]
+fn root_constant_pair_reads_stop_at_the_bound_size() {
+    for body in [&GLOBAL_DWORD_3, &SCALAR_DWORD_3] {
+        reads_through_a_root_constant_pair(body, 16, 0x103);
+        reads_through_a_root_constant_pair(body, 12, 0);
+        reads_through_a_root_constant_pair(body, 0, 0);
+    }
 }
