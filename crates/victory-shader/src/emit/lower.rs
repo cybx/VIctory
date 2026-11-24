@@ -799,12 +799,7 @@ impl<'a> Lower<'a> {
             }
             let guard = self.guard(b, i)?;
             let vals = self.vgprs(inst, data.as_ref().ok_or("a global store value")?, n as u8)?;
-            let c = self.cur;
-            let mut off = self.s.m.i32(a.offset);
-            if let Some(d) = a.dynamic {
-                let d = self.i32_of(d)?;
-                off = self.s.m.bin(c, Bin::Add, off, d);
-            }
+            let off = self.address_offset(a)?;
             let src = Source::Built {
                 address: a,
                 bits: 0,
