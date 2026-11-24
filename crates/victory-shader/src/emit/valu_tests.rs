@@ -1744,3 +1744,139 @@ fn root_view_reads_stop_at_the_bound_size() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// Indexed (structured) loads, stores and atomics through a root UAV whose
+/// title declares a stride reach byte `index * stride + offset` of the
+/// buffer the root UAV binds: the host view is raw, with no stride of its
+/// own. They stop at the bytes the host binds, and an index whose byte
+/// would wrap past 4 GiB reaches nothing.
+#[test]
+fn structured_access_through_a_root_uav_reaches_index_times_stride() {
+    const STRIDE: u32 = 8;
+    // MUBUF `op vdata, vaddr(index), s[srsrc:srsrc+3], 0 idxen offset:off`.
+    let mubuf_idxen = |op: u32, vdata: u8, vaddr: u8, srsrc: u8, off: u16| -> [u32; 2] {
+        [
+            0x38 << 26 | op << 18 | 1 << 13 | (off as u32 & 0xFFF),
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    };
+    const STORE: u32 = 0x1C; // buffer_store_dword
+    const LOAD: u32 = 0x0C; // buffer_load_dword
+    const ATOMIC_ADD: u32 = 0x32; // buffer_atomic_add (no return)
+
+    // s[0:1] the root UAV's address, s2 a root constant: the index.
+    let mut words = vec![
+        // A buffer descriptor around the root UAV in s[8:11].
+        s_mov_b32(8, 0),
+        s_mov_b32(9, 1),
+        s_mov_b32(10, 0xC1), // -1 records
+        s_mov_b32(11, 0xFF),
+        0x3101_4FAC,
+        vop1(0x001, 1, sgpr(2)), // v1 = s2 (index)
+        vop1(0x001, 2, 0xFF),    // v2 = 0xABCD
+        0x0000_ABCD,
+        vop1(0x001, 3, 128 + 5), // v3 = 5
+        vop1(0x001, 5, 128),     // v5 = 0 (index)
+    ];
+    // Element s2: dword 1 = 0xABCD, dword 0 += 5; then element 0, dword 0 =
+    // what element s2 byte 4 holds.
+    words.extend(mubuf_idxen(STORE, 2, 1, 8, 4));
+    words.extend(mubuf_idxen(ATOMIC_ADD, 3, 1, 8, 0));
+    words.extend(mubuf_idxen(LOAD, 4, 1, 8, 4));
+    words.extend(mubuf_idxen(STORE, 4, 5, 8, 0));
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let root = |root, sgprs, user_data, slot| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs,
+        base_register: 0,
+        user_data,
+        slot,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            root(RootType::Descriptor, 2, 0, 0),
+            root(RootType::Constants, 1, 2, 1),
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: STRIDE,
+            dwords: 2,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 3 << 1, // 3 user SGPRs: s0..s2
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let container = crate::dxbc::build(&[]);
+    let c = crate::Container::parse(&container).expect("container");
+    let shader = super::emit(&c, &native, &p, &st, &io, &res, super::Target::ANY).expect("emit");
+    assert_eq!(shader.root_uavs, [0]);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        for (index, bytes, want) in [
+            // Element 2 is bytes 16..24 of the buffer.
+            (2, 24, [0xABCD, 0, 0, 0, 5, 0xABCD, 0, 0]),
+            (2, 20, [0, 0, 0, 0, 5, 0, 0, 0]),
+            (2, 16, [0; 8]),
+            // 8 * index + 4 wraps to byte 0x14, which the view holds.
+            (0x2000_0002, 32, [0; 8]),
+        ] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match u.root {
+                    RootType::Constants => index,
+                    RootType::Descriptor => bytes,
+                    root => super::host::guard(root, 1, 0)
+                        .unwrap_or_else(|| panic!("unexpected user data {u:?}")),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud)), (1, Root::Uav(8))],
+                        views: &[],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(
+                out[0][..8],
+                want,
+                "{label}: index {index:#x}, {bytes} bytes bound"
+            );
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
