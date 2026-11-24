@@ -234,6 +234,18 @@ fn emit_uav_barrier(list: &HostList) {
     unsafe { list.list.ResourceBarrier(&[barrier]) };
 }
 
+/// The kind of root view title root parameter `slot` is bound as for
+/// `stage` (a root CBV unless the stage reads it as an SRV or UAV).
+fn root_view_kind(stage: &crate::pipeline::host::Stage, slot: u8) -> RootView {
+    if stage.root_uavs.iter().any(|r| r.0 == slot) {
+        RootView::Uav
+    } else if stage.root_srvs.iter().any(|r| r.0 == slot) {
+        RootView::Srv
+    } else {
+        RootView::Cbv
+    }
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -446,9 +458,15 @@ impl State {
         };
     }
 
-    /// The value of user-data dword `u` of a translated shader: a root
-    /// argument, or a bound heap's guard slot.
-    fn user_dword(&self, compute: bool, u: &victory_shader::emit::UserData) -> u32 {
+    /// The value of user-data dword `u` of the translated shader of
+    /// `stage`: a root argument, a bound heap's guard slot, or for a root
+    /// view the bytes it holds (see [`State::root_view_bytes`]).
+    fn user_dword(
+        &self,
+        compute: bool,
+        stage: &crate::pipeline::host::Stage,
+        u: &victory_shader::emit::UserData,
+    ) -> u32 {
         let guard = |samplers: bool| {
             let h = self.heaps[usize::from(samplers)];
             (h != 0)
@@ -459,6 +477,9 @@ impl State {
         match u.root {
             RootType::ResourceHeap => guard(false),
             RootType::SamplerHeap => guard(true),
+            RootType::Descriptor => {
+                self.root_view_bytes(compute, u.slot, root_view_kind(stage, u.slot))
+            }
             _ => self.user_value(compute, u.slot, u.root, u.dword),
         }
     }
@@ -489,6 +510,31 @@ impl State {
                 0
             }
         }
+    }
+
+    /// The bytes root view `slot` holds from its start as the host binds
+    /// it ([`root_view`], or [`State::root_srv_table`]): [`root_len`] of
+    /// its host copy, so at most 64 KiB for a CBV, [`ROOT_SRV_MAX`] for an
+    /// SRV and [`ROOT_UAV_MAX`] for a UAV, the bytes refreshed (and for a
+    /// UAV copied back). Shaders check their accesses against it: a root
+    /// view has no bounds on the host, and an access past the memory it
+    /// maps is a GPU page fault, which some hosts stall on until the driver
+    /// resets the device. 0 for a root view bound to a fallback (unset,
+    /// null, outside title memory the host copies, or misaligned).
+    fn root_view_bytes(&self, compute: bool, slot: u8, kind: RootView) -> u32 {
+        let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return 0;
+        };
+        if address == 0 {
+            return 0;
+        }
+        let Some(shadow) = crate::shadow::find(address, 1) else {
+            return 0;
+        };
+        if kind != RootView::Cbv && !shadow.gpu(address).is_multiple_of(4) {
+            return 0;
+        }
+        u32::try_from(root_len(shadow.left(address), kind)).unwrap_or(u32::MAX)
     }
 
     /// The bound heap holding `handle`.
@@ -653,7 +699,7 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None => self.user_dword(compute, u),
+                        None => self.user_dword(compute, stage, u),
                     };
                 }
                 // SAFETY: an open list; `values` covers the parameter.
@@ -881,8 +927,12 @@ impl State {
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
             for u in &t.host.user_data {
-                let v = self.user_dword(compute, u);
+                let v = self.user_dword(compute, stage, u);
                 let _ = write!(text, " u{}={v:#x}", u.index);
+                if u.root == RootType::Descriptor {
+                    // A root view's size, no heap index.
+                    continue;
+                }
                 let index = if u.root == RootType::Table { v / 32 } else { v };
                 if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
                     let _ = write!(text, " [heap {index}: {slot}]");
