@@ -388,22 +388,13 @@ fn writable(at: usize) -> bool {
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
-        // SAFETY: a fresh write-watched allocation, freed at the end.
-        let p = unsafe {
-            VirtualAlloc(
-                std::ptr::null(),
-                4 * PAGE,
-                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
-                PAGE_READWRITE,
-            )
-        } as usize;
-        assert_ne!(p, 0);
+        let p = watched(4);
         let (start, end) = (p, p + 4 * PAGE);
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
@@ -424,8 +415,6 @@ mod tests {
             )
             .is_none()
         );
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
     #[test]
