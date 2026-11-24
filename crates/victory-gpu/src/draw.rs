@@ -1937,6 +1937,8 @@ mod tests {
         };
         let (shader, used) = build_root_view_cs();
         let pso = crate::pipeline::test_compute_pipeline(shader, used);
+        // Root SRVs bind as one-view tables in the bound view heap.
+        let views = crate::descriptor::test_view_heap(64);
 
         let unmapped = Allocation::reserved_unmapped(8 << 20);
         let mid_unmapped = unmapped.addr() + (4 << 20);
@@ -1962,6 +1964,7 @@ mod tests {
         let list = host.new_list().expect("new_list");
         let mut state = State::default();
         state.set_pipeline(pso);
+        state.set_heaps(&[views]);
         state.set_view(true, 1, 0);
         state.set_view(true, 2, mid_unmapped);
         state.dispatch(&list, 1, 1, 1);
@@ -1973,6 +1976,7 @@ mod tests {
         //    0 ^ 0 ^ 0xA5A5_5A5A = 0xA5A5_5A5A in CPU title memory.
         list.reset();
         state.reset(pso);
+        state.set_heaps(&[views]);
         state.set_view(true, 2, uav_buf.addr());
         state.dispatch(&list, 1, 1, 1);
         list.close();
@@ -1988,6 +1992,7 @@ mod tests {
         //    UAV writing +1.5 MiB) and verify full extent refresh + write-back.
         list.reset();
         state.reset(pso);
+        state.set_heaps(&[views]);
         state.set_view(true, 0, cbv_buf.addr());
         state.set_view(true, 1, srv_buf.addr());
         state.set_view(true, 2, uav_buf.addr());
@@ -2009,6 +2014,7 @@ mod tests {
         }
         list.reset();
         state.reset(pso);
+        state.set_heaps(&[views]);
         state.set_view(true, 0, cbv_buf.addr());
         state.set_view(true, 1, srv_buf.addr());
         state.set_view(true, 2, uav_buf.addr());

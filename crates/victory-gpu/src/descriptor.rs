@@ -638,6 +638,33 @@ pub(crate) extern "system" fn create_heap(
     object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out)
 }
 
+/// A shader-visible view heap of `count` descriptors, for tests that draw:
+/// root SRVs bind through it (see [`crate::pipeline::host::bounded_root_srvs`]).
+#[cfg(test)]
+pub(crate) fn test_view_heap(count: u32) -> This {
+    // With the placement newer titles pass after it (none: heap memory).
+    #[repr(C)]
+    struct Extended(HeapDesc, Placement);
+    let extended = Extended(
+        HeapDesc {
+            kind: 0,
+            count,
+            flags: 1,
+            nodes: 0,
+        },
+        Placement {
+            address: 0,
+            size: 0,
+        },
+    );
+    let mut out = std::ptr::null();
+    assert_eq!(
+        create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], &mut out),
+        crate::object::S_OK
+    );
+    out
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &HEAP_IIDS).then_some(this);
     object::answer(DESCRIPTOR_HEAP, iid, found, out)
