@@ -267,7 +267,7 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let p = build_ir(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
@@ -275,6 +275,19 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res, target)
+}
+
+/// Builds the SSA of `native` as [`translate_for`] does: a compute program
+/// whose root arguments all sit past the 16 user SGPRs finds them through
+/// the spill table `s[0:1]` points to, so its table loads read them.
+pub fn build_ir(native: &NativeProgram) -> Result<ir::Program, ShaderError> {
+    let spilled = native.stage == HwStage::Cs
+        && !native.layout.is_empty()
+        && native
+            .layout
+            .iter()
+            .all(|r| native.stage.user_sgpr(r.user_data) >= 16);
+    ir::build_with(&native.patched_code(), native.wave64, native.vgprs, spilled)
 }
 
 /// Emits a program whose earlier stages already ran, for `target`.
@@ -1070,10 +1083,10 @@ mod tests {
         let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1), (FourCC::PSG1, &psg1)]);
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
-        emit(&c, &native, &p, &st, &io, &res)
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        emit(&c, &native, &p, &st, &io, &res, Target::ANY)
     }
 
     /// The vertex and primitive maxima a translated mesh shader's `PSV0`
