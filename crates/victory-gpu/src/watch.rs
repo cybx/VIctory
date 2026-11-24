@@ -392,6 +392,13 @@ mod tests {
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+    /// The journal has one sweeper: tests that sweep take turns, or one's
+    /// sweep ends inside another's and its nested askings go to the kernel.
+    fn one_sweep() -> std::sync::MutexGuard<'static, ()> {
+        static SWEEPS: Mutex<()> = Mutex::new(());
+        SWEEPS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn written_pages_are_reported_to_every_asker() {
         let p = watched(4);
@@ -457,6 +464,7 @@ mod tests {
         let p = watched(4);
         // SAFETY: committed pages of ours.
         unsafe { ((p + 2 * PAGE) as *mut u8).write(1) };
+        let _turn = one_sweep();
         let sweep = Sweep::begin();
         let (outer, all) = writes(p, p + 4 * PAGE, false).expect("watched");
         assert_eq!(all, [(p / PAGE + 2, outer)]);
@@ -477,6 +485,7 @@ mod tests {
     #[test]
     fn a_sweep_asks_again_after_its_own_write() {
         let p = watched(2);
+        let _turn = one_sweep();
         let sweep = Sweep::begin();
         let (_, before) = writes(p, p + 2 * PAGE, false).expect("watched");
         assert!(before.is_empty());
