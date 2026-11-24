@@ -812,7 +812,7 @@ impl State {
             }
         };
         if let Some((a, s)) = &shadow {
-            s.refresh(list, *a, s.left(*a).min(1 << 20));
+            s.refresh(list, *a, root_len(s.left(*a), RootView::Srv));
             list.buffer_state(&s.buffer, crate::host::BUFFER_READ);
         }
         let handle = host.gpu_handle(index);
